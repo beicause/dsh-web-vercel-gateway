@@ -176,6 +176,35 @@ test('a refused model is skipped and the fetch is not repeated', async () => {
   assert.equal(server.requests, 1)
 })
 
+test('concurrent first asks share one fetch', async () => {
+  const server = await catalogServer({ data: [entry('vendor/a'), entry('vendor/b')] })
+  const catalog = new ModelCatalog(() => settingsFor(server.baseURL))
+  const answers = await Promise.all([catalog.models(), catalog.models(), catalog.models()])
+  assert.equal(server.requests, 1)
+  for (const answer of answers) assert.deepEqual(answer, ['vendor/a', 'vendor/b'])
+})
+
+test('one caller cancelling leaves the shared fetch for the others', async () => {
+  const server = await catalogServer({ data: [entry('vendor/a')] })
+  const catalog = new ModelCatalog(() => settingsFor(server.baseURL))
+  const controller = new AbortController()
+  const cancelled = catalog.models(controller.signal)
+  const surviving = catalog.models()
+  controller.abort(new Error('caller went away'))
+  await assert.rejects(cancelled, /caller went away/)
+  assert.deepEqual(await surviving, ['vendor/a'])
+  assert.equal(server.requests, 1)
+})
+
+test('an aborted signal rejects without asking the catalogue', async () => {
+  const server = await catalogServer({ data: [entry('vendor/a')] })
+  const catalog = new ModelCatalog(() => settingsFor(server.baseURL))
+  const controller = new AbortController()
+  controller.abort(new Error('already gone'))
+  await assert.rejects(catalog.models(controller.signal), /already gone/)
+  assert.equal(server.requests, 0)
+})
+
 test('invalidate() fetches again and forgets refusals', async () => {
   const server = await catalogServer({ data: [entry('vendor/a'), entry('vendor/b')] })
   const catalog = new ModelCatalog(() => settingsFor(server.baseURL))

@@ -109,6 +109,29 @@ export function orderCandidates(models, preferred) {
   return [...head, ...models.filter(model => !chosen.has(model))]
 }
 
+/**
+ * Settle with `promise`, or reject as soon as `signal` aborts.
+ *
+ * The promise itself keeps running: it is shared, and another operation may be
+ * waiting on the same answer.
+ * @template T
+ * @param {Promise<T>} promise the work to wait for.
+ * @param {AbortSignal} signal cancellation of this wait only.
+ * @returns {Promise<T>} the promise's outcome, or the abort.
+ */
+function raceAbort(promise, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    /** @param {Event} _event the abort event. */
+    const onAbort = (_event) => { reject(signal.reason) }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value) },
+      (error) => { signal.removeEventListener('abort', onAbort); reject(error) },
+    )
+  })
+}
+
 /** A catalogue shared by both providers: one cached list and one record of refusals. */
 export class ModelCatalog {
   /**
@@ -121,6 +144,13 @@ export class ModelCatalog {
     this.cached = undefined
     /** When the cached list was fetched, in epoch milliseconds. */
     this.cachedAt = 0
+    /**
+     * The fetch already in progress, if any. A cold start has no answer yet, so
+     * two operations arriving together would otherwise both read the catalogue
+     * and pay for it twice.
+     * @type {Promise<readonly string[]> | undefined}
+     */
+    this.pending = undefined
     /** @type {Map<string, number>} model id to the moment it refused, so a refusal ages out with the cache. */
     this.refused = new Map()
   }
@@ -129,6 +159,7 @@ export class ModelCatalog {
   invalidate() {
     this.cached = undefined
     this.cachedAt = 0
+    this.pending = undefined
     this.refused.clear()
   }
 
@@ -159,7 +190,12 @@ export class ModelCatalog {
     if (this.cached !== undefined && Date.now() - this.cachedAt < CATALOG_TTL_MS) {
       all = this.cached
     } else {
-      all = await this.fetchCatalog(settings, signal)
+      // One fetch answers every caller that arrives while it runs. The shared
+      // fetch ignores a caller's signal — one cancellation must not throw away
+      // an answer another operation is waiting for — so this caller instead
+      // stops waiting when its own signal fires.
+      this.pending ??= this.fetchCatalog(settings).finally(() => { this.pending = undefined })
+      all = signal === undefined ? await this.pending : await raceAbort(this.pending, signal)
     }
     const now = Date.now()
     /** @type {string[]} */
@@ -182,18 +218,16 @@ export class ModelCatalog {
 
   /**
    * @param {{ baseURL: string, timeoutMs: number, WebError: WebErrorConstructor }} settings endpoint and error class.
-   * @param {AbortSignal} [signal] caller cancellation.
    * @returns {Promise<readonly string[]>} every usable model, regardless of refusals.
    * @throws {Error} the seam's WebError when the catalogue cannot be read.
    */
-  async fetchCatalog(settings, signal) {
+  async fetchCatalog(settings) {
     const url = catalogURL(settings.baseURL)
     const { WebError } = settings
     // The catalogue is one small JSON document, but it is fetched on the way to
     // a search the caller is waiting for, so it gets the same time bound rather
     // than an unbounded wait.
-    const deadline = AbortSignal.timeout(settings.timeoutMs)
-    const bounded = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    const bounded = AbortSignal.timeout(settings.timeoutMs)
     /** @type {Response} */
     let response
     try {
