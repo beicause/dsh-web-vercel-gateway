@@ -176,6 +176,35 @@ test('a refused model is skipped and the fetch is not repeated', async () => {
   assert.equal(server.requests, 1)
 })
 
+test('a prefetch serves the first operation without fetching again', async () => {
+  const server = await catalogServer({ data: [entry('vendor/a'), entry('vendor/b')] })
+  const catalog = new ModelCatalog(() => settingsFor(server.baseURL))
+  catalog.warm()
+  assert.deepEqual(await catalog.models(), ['vendor/a', 'vendor/b'])
+  assert.equal(server.requests, 1)
+})
+
+test('a prefetch that fails leaves the lazy path intact', async () => {
+  const catalog = new ModelCatalog(() => settingsFor('http://127.0.0.1:1/v4/ai/language-model'))
+  catalog.warm()
+  await assert.rejects(catalog.models(), /could not be read/)
+})
+
+test('a prefetch failure is not an unhandled rejection', async () => {
+  const catalog = new ModelCatalog(() => settingsFor('http://127.0.0.1:1/v4/ai/language-model'))
+  catalog.warm()
+  await new Promise((/** @type {(value?: unknown) => void} */ resolve) => setTimeout(resolve, 100))
+})
+
+test('a prefetch does not refetch while its answer is fresh', async () => {
+  const server = await catalogServer({ data: [entry('vendor/a')] })
+  const catalog = new ModelCatalog(() => settingsFor(server.baseURL))
+  await catalog.models()
+  catalog.warm()
+  await catalog.models()
+  assert.equal(server.requests, 1)
+})
+
 test('concurrent first asks share one fetch', async () => {
   const server = await catalogServer({ data: [entry('vendor/a'), entry('vendor/b')] })
   const catalog = new ModelCatalog(() => settingsFor(server.baseURL))
@@ -203,6 +232,45 @@ test('an aborted signal rejects without asking the catalogue', async () => {
   controller.abort(new Error('already gone'))
   await assert.rejects(catalog.models(controller.signal), /already gone/)
   assert.equal(server.requests, 0)
+})
+
+test('an answer that arrives after invalidate() is not cached', async () => {
+  /** @type {(value?: unknown) => void} */
+  let release = () => {}
+  const gate = new Promise((resolve) => { release = resolve })
+  let served = 0
+  const server = createServer((request, response) => {
+    request.resume()
+    served += 1
+    const body = served === 1
+      ? { data: [entry('vendor/old')] }
+      : { data: [entry('vendor/new')] }
+    Promise.resolve(gate).then(() => {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify(body))
+    })
+  })
+  servers.push(server)
+  await new Promise((/** @type {(value?: unknown) => void} */ resolve) => { server.listen(0, '127.0.0.1', () => resolve()) })
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new Error('no port')
+  const baseURL = 'http://127.0.0.1:' + String(address.port) + '/v4/ai/language-model'
+
+  const catalog = new ModelCatalog(() => settingsFor(baseURL))
+  const stale = catalog.models()
+  catalog.invalidate()
+  release()
+  assert.deepEqual(await stale, ['vendor/old'])
+  assert.deepEqual(await catalog.models(), ['vendor/new'])
+  assert.equal(served, 2)
+})
+
+test('a cached answer keeps serving after its read settles', async () => {
+  const server = await catalogServer({ data: [entry('vendor/a')] })
+  const catalog = new ModelCatalog(() => settingsFor(server.baseURL))
+  await catalog.models()
+  assert.deepEqual(await catalog.models(), ['vendor/a'])
+  assert.equal(server.requests, 1)
 })
 
 test('invalidate() fetches again and forgets refusals', async () => {

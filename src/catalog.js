@@ -151,16 +151,46 @@ export class ModelCatalog {
      * @type {Promise<readonly string[]> | undefined}
      */
     this.pending = undefined
+    /**
+     * Bumped by invalidate(), so a read that started before it knows its answer
+     * is no longer wanted.
+     */
+    this.generation = 0
     /** @type {Map<string, number>} model id to the moment it refused, so a refusal ages out with the cache. */
     this.refused = new Map()
   }
 
-  /** Forget the cached list and every refusal; the next ask fetches again. */
+  /**
+   * Forget the cached list and every refusal. A read already in flight is
+   * abandoned rather than cached, so its answer cannot land after the decision
+   * to forget it.
+   */
   invalidate() {
+    this.generation += 1
     this.cached = undefined
     this.cachedAt = 0
     this.pending = undefined
     this.refused.clear()
+  }
+
+  /**
+   * Start the catalogue read, or join the one already running, and let the
+   * shared promise clear itself once it settles.
+   *
+   * Both the prefetch and every operation go through here: sharing one promise
+   * is what keeps a cold start from reading the same document twice, and
+   * clearing it on settle is what lets a later read — after the cached answer
+   * expires, or after a failure — actually happen.
+   * @returns {Promise<readonly string[]>} the catalogue's usable ids.
+   */
+  start() {
+    if (this.pending !== undefined) return this.pending
+    const generation = this.generation
+    /** @type {Promise<readonly string[]>} */
+    const started = this.fetchCatalog(this.readSettings(), generation)
+      .finally(() => { if (this.pending === started) this.pending = undefined })
+    this.pending = started
+    return started
   }
 
   /**
@@ -172,6 +202,24 @@ export class ModelCatalog {
    */
   remember(model) {
     this.refused.set(model, Date.now())
+  }
+
+  /**
+   * Read the catalogue ahead of the first operation, so that operation does not
+   * pay for it.
+   *
+   * This runs when the plugin mounts, which is why it never rejects and never
+   * reports: a gateway that is unreachable, a credential that has not been added
+   * yet, or a process that never searches must all leave mounting exactly as it
+   * was. A failure here costs nothing, because the next operation asks again.
+   * @returns {void}
+   */
+  warm() {
+    if (this.cached !== undefined && Date.now() - this.cachedAt < CATALOG_TTL_MS) return
+    // The promise stays shared with whoever asks next, so it must keep rejecting
+    // for them; this handler only stops a failed prefetch nobody awaited from
+    // becoming an unhandled rejection.
+    this.start().catch(() => {})
   }
 
   /**
@@ -190,12 +238,12 @@ export class ModelCatalog {
     if (this.cached !== undefined && Date.now() - this.cachedAt < CATALOG_TTL_MS) {
       all = this.cached
     } else {
-      // One fetch answers every caller that arrives while it runs. The shared
-      // fetch ignores a caller's signal — one cancellation must not throw away
+      // One read answers every caller that arrives while it runs. The shared
+      // read ignores a caller's signal — one cancellation must not throw away
       // an answer another operation is waiting for — so this caller instead
       // stops waiting when its own signal fires.
-      this.pending ??= this.fetchCatalog(settings).finally(() => { this.pending = undefined })
-      all = signal === undefined ? await this.pending : await raceAbort(this.pending, signal)
+      const pending = this.start()
+      all = signal === undefined ? await pending : await raceAbort(pending, signal)
     }
     const now = Date.now()
     /** @type {string[]} */
@@ -218,10 +266,11 @@ export class ModelCatalog {
 
   /**
    * @param {{ baseURL: string, timeoutMs: number, WebError: WebErrorConstructor }} settings endpoint and error class.
+   * @param {number} generation the invalidation generation this read was started in.
    * @returns {Promise<readonly string[]>} every usable model, regardless of refusals.
    * @throws {Error} the seam's WebError when the catalogue cannot be read.
    */
-  async fetchCatalog(settings) {
+  async fetchCatalog(settings, generation) {
     const url = catalogURL(settings.baseURL)
     const { WebError } = settings
     // The catalogue is one small JSON document, but it is fetched on the way to
@@ -270,8 +319,12 @@ export class ModelCatalog {
         { cause: error },
       )
     }
-    this.cached = models
-    this.cachedAt = Date.now()
+    // An answer that arrives after invalidate() describes a catalogue the
+    // caller already chose to forget.
+    if (generation === this.generation) {
+      this.cached = models
+      this.cachedAt = Date.now()
+    }
     return models
   }
 }

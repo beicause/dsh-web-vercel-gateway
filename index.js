@@ -104,6 +104,12 @@ export function apply(ctx, config) {
     resolveKey: (/** @type {string} */ ref) => resolveGatewayKey(ctx, ref),
     keyConfigured: (/** @type {string} */ ref) => gatewayKeyConfigured(ctx, ref),
   })
+  // The catalogue is read ahead of the first operation rather than when the
+  // plugin mounts: mounting must not block on the network or fail because the
+  // gateway is unreachable, and a process that never searches should not care
+  // either way. This only removes the wait from the first search; a prefetch
+  // that fails leaves the lazy path exactly as it was.
+  catalog.warm()
   const search = new VercelSearchProvider(options)
   const fetch = new VercelFetchProvider(options)
   ctx.web.registerSearchProvider({
