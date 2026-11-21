@@ -81,10 +81,15 @@ export class VercelFetchProvider {
     this.resolveOptions = resolveOptions
   }
 
-  /** @returns {boolean} whether the settings could address a gateway at all. */
+  /**
+   * Whether the settings could address a gateway at all. An empty model list is
+   * addressable: it asks the catalogue instead of naming an id, and this check
+   * must not reach the network to learn the same thing.
+   * @returns {boolean} whether a request has somewhere to go.
+   */
   available() {
     const options = this.resolveOptions()
-    return options.credentialRef.length > 0 && options.models.length > 0 && URL.canParse(options.baseURL)
+    return options.credentialRef.length > 0 && URL.canParse(options.baseURL)
   }
 
   /** @returns {Promise<boolean>} whether the credential reference has a value. */

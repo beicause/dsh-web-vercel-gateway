@@ -5,6 +5,7 @@
  * reports timings that only matter when judging whether the gateway path is
  * still worth using.
  */
+import { ModelCatalog } from '../src/catalog.js'
 import { VercelFetchProvider } from '../src/fetch.js'
 import { parseModels } from '../src/gateway.js'
 import { VercelSearchProvider } from '../src/search.js'
@@ -28,10 +29,18 @@ if (apiKey === undefined || apiKey.length === 0) {
   process.exit(1)
 }
 
+const baseURL = process.env.AI_GATEWAY_BASE_URL ?? 'https://ai-gateway.vercel.sh/v4/ai/language-model'
+const pinned = parseModels(process.env.AI_GATEWAY_MODEL ?? '')
+const catalog = new ModelCatalog(() => ({ baseURL, timeoutMs: 60000, WebError }))
+if (pinned.length === 0) {
+  console.log('no model pinned; candidates: ' + (await catalog.models()).join(', '))
+}
+
 /** @returns {import('../src/contracts.js').ProviderOptions} settings of one operation. */
 const options = () => ({
-  baseURL: process.env.AI_GATEWAY_BASE_URL ?? 'https://ai-gateway.vercel.sh/v4/ai/language-model',
-  models: parseModels(process.env.AI_GATEWAY_MODEL ?? 'google/gemini-2.5-flash-lite, openai/gpt-4o-mini'),
+  baseURL,
+  models: pinned,
+  catalog,
   credentialRef: 'AI_GATEWAY_API_KEY',
   count: 3,
   maxOutputTokens: 2000,

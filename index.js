@@ -19,6 +19,7 @@
 
 import { WebError } from '@deepseek-ai/dsh-web'
 import z from '@deepseek-ai/schemastery'
+import { ModelCatalog } from './src/catalog.js'
 import { gatewayKeyConfigured, resolveGatewayKey } from './src/credential.js'
 import { VercelFetchProvider } from './src/fetch.js'
 import { parseModels } from './src/gateway.js'
@@ -40,12 +41,15 @@ export const inject = ['web']
 const DEFAULT_BASE_URL = 'https://ai-gateway.vercel.sh/v4/ai/language-model'
 
 /**
- * Default models, in retry order. The gateway limits each model separately, so a
- * second model doubles the request budget; both entries answer a forced tool call
- * in a few seconds and both were measured against the live gateway. Cheap first,
- * because the fallback only runs when the gateway turns the first away.
+ * Default model setting: empty, which means discover.
+ *
+ * A pinned default is a promise this package cannot keep — the gateway retires
+ * ids continuously and a retired one fails every search until a new release
+ * ships. Leaving the setting empty lets the catalogue answer instead, and the
+ * preference list in `src/catalog.js` only decides which discovered models are
+ * asked first.
  */
-const DEFAULT_MODEL = 'google/gemini-2.5-flash-lite, openai/gpt-4o-mini'
+const DEFAULT_MODEL = ''
 
 /** Default credential reference of the gateway key. */
 const DEFAULT_API_KEY_ENV = 'AI_GATEWAY_API_KEY'
@@ -66,7 +70,7 @@ const DEFAULT_TIMEOUT_MS = 60000
 /** Settings of both providers; every field is live so a settings page edit applies without a remount. */
 export const Config = z.object({
   baseURL: z.string().default(DEFAULT_BASE_URL).description('Gateway endpoint that accepts provider-executed tools.').volatile(),
-  model: z.string().default(DEFAULT_MODEL).description('Gateway models that perform the forced tool call, in retry order, separated by commas.').volatile(),
+  model: z.string().default(DEFAULT_MODEL).description('Gateway models that perform the forced tool call, in retry order, separated by commas. Empty discovers them from the gateway catalogue.').volatile(),
   apiKeyEnv: z.string().default(DEFAULT_API_KEY_ENV).role('credential-ref').description('Credential reference of the gateway key.').volatile(),
   count: z.number().step(1).min(1).max(50).default(DEFAULT_COUNT).description('Results requested per search.').volatile(),
   maxOutputTokens: z.number().step(1).min(256).default(DEFAULT_MAX_OUTPUT_TOKENS).description('Output-token floor of each gateway request.').volatile(),
@@ -80,10 +84,18 @@ export const Config = z.object({
  * @returns {void}
  */
 export function apply(ctx, config) {
+  // One catalogue for both providers: a discovery fetch and a refusal are facts
+  // about the gateway, not about whether a search or a fetch asked.
+  const catalog = new ModelCatalog(() => ({
+    baseURL: config.baseURL.get(),
+    timeoutMs: config.timeoutMs.get(),
+    WebError,
+  }))
   /** @returns {ProviderOptions} the settings for the NEXT operation. */
   const options = () => ({
     baseURL: config.baseURL.get(),
     models: parseModels(config.model.get()),
+    catalog,
     credentialRef: config.apiKeyEnv.get(),
     count: config.count.get(),
     maxOutputTokens: config.maxOutputTokens.get(),

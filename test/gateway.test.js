@@ -57,6 +57,7 @@ async function serve(handler) {
 const optionsFor = (baseURL, overrides = {}) => ({
   baseURL,
   models: ['test/model'],
+  catalog: stubCatalog(),
   apiKey: 'test-key',
   credentialRef: 'AI_GATEWAY_API_KEY',
   count: 10,
@@ -65,6 +66,21 @@ const optionsFor = (baseURL, overrides = {}) => ({
   WebError: FakeWebError,
   ...overrides,
 })
+
+/**
+ * A catalogue that answers with a fixed list and records what it was told.
+ * @param {readonly string[]} [models] the ids it offers.
+ * @returns {import('../src/contracts.js').ModelCatalog & { remembered: string[] }} the catalogue and its refusal log.
+ */
+function stubCatalog(models = []) {
+  /** @type {string[]} */
+  const remembered = []
+  return {
+    models: async () => models,
+    remember: (/** @type {string} */ model) => { remembered.push(model) },
+    remembered,
+  }
+}
 
 /**
  * One SSE frame.
@@ -171,15 +187,17 @@ test('names the credential on 401', async () => {
   )
 })
 
-test('names the model on 404', async () => {
+test('names the model on 404 and remembers it', async () => {
   const baseURL = await serve((_request, response) => {
     response.writeHead(404, { 'content-type': 'application/json' })
     response.end(JSON.stringify({ error: { message: "Model 'test/model' not found", type: 'model_not_found' } }))
   })
+  const catalog = stubCatalog(['test/model'])
   await assert.rejects(
-    callGateway(optionsFor(baseURL), { tool: SEARCH_TOOL, args: { query: 'q' } }),
-    (/** @type {any} */ error) => error.message.includes('test/model') && error.message.includes('gemini-2.5-flash-lite'),
+    callGateway(optionsFor(baseURL, { catalog }), { tool: SEARCH_TOOL, args: { query: 'q' } }),
+    (/** @type {any} */ error) => error.message.includes('test/model') && error.message.includes('no longer'),
   )
+  assert.deepEqual(catalog.remembered, ['test/model'])
 })
 
 test('reports rate limiting on 429', async () => {

@@ -73,6 +73,7 @@ async function gateway(result, options = {}) {
 const optionsFor = (baseURL, overrides = {}) => ({
   baseURL,
   models: ['test/model'],
+  catalog: { models: async () => [], remember: () => {} },
   credentialRef: 'AI_GATEWAY_API_KEY',
   count: 10,
   maxOutputTokens: 2000,
@@ -151,7 +152,7 @@ test('available() checks settings shape without reading the credential', () => {
   const search = new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { keyConfigured: async () => false }))
   assert.equal(search.available(), true)
   assert.equal(new VercelSearchProvider(() => optionsFor('not a url')).available(), false)
-  assert.equal(new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { models: [] })).available(), false)
+  assert.equal(new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { models: [] })).available(), true)
   assert.equal(new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { credentialRef: '' })).available(), false)
 })
 
@@ -160,6 +161,66 @@ test('ready() answers from the credential store', async () => {
   const missing = new VercelFetchProvider(() => optionsFor('https://gateway.invalid/x', { keyConfigured: async () => false }))
   assert.equal(await configured.ready(), true)
   assert.equal(await missing.ready(), false)
+})
+
+test('an empty model setting discovers the candidate list', async () => {
+  const server = await gateway({ results: [{ url: 'https://example.com' }] })
+  let asked = 0
+  const catalog = {
+    /** @param {AbortSignal} [_signal] caller cancellation. */
+    models: async (_signal) => {
+      asked += 1
+      return ['vendor/first']
+    },
+    /** @param {string} _model the id that refused. */
+    remember: (_model) => {},
+  }
+  const provider = new VercelSearchProvider(() => optionsFor(server.baseURL, { models: [], catalog }))
+  const result = await provider.search({ query: 'q' })
+  assert.equal(result.sources.length, 1)
+  assert.equal(asked, 1)
+  assert.equal(server.received[0].tools[0].id, 'gateway.deepseek_search')
+})
+
+test('a model that refuses permanently is remembered', async () => {
+  let calls = 0
+  const rejecting = createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      calls += 1
+      const model = request.headers['ai-language-model-id']
+      if (model === 'vendor/free') {
+        response.writeHead(403, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ error: { message: 'Free tier users do not have access to this model' } }))
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end('data: ' + JSON.stringify({
+        type: 'tool-result',
+        toolName: 'deepseek_search',
+        isError: false,
+        result: { results: [{ url: 'https://example.com' }] },
+      }) + '\n\n')
+    })
+  })
+  servers.push(rejecting)
+  await new Promise((/** @type {(value?: unknown) => void} */ resolve) => { rejecting.listen(0, '127.0.0.1', () => resolve()) })
+  const address = rejecting.address()
+  if (address === null || typeof address === 'string') throw new Error('no port')
+  const baseURL = 'http://127.0.0.1:' + String(address.port) + '/v4/ai/language-model'
+
+  /** @type {string[]} */
+  const remembered = []
+  const catalog = {
+    models: async () => ['vendor/free', 'vendor/paid'],
+    /** @param {string} model the id that refused. */
+    remember: (model) => { remembered.push(model) },
+  }
+  const provider = new VercelSearchProvider(() => optionsFor(baseURL, { models: ['vendor/free', 'vendor/paid'], catalog }))
+  const result = await provider.search({ query: 'q' })
+  assert.equal(result.sources.length, 1)
+  assert.deepEqual(remembered, ['vendor/free'])
+  assert.equal(calls, 2)
 })
 
 test('each operation reads one settings snapshot', async () => {

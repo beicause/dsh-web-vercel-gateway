@@ -43,18 +43,39 @@ export interface GatewayOperation {
   readonly args: Record<string, unknown>
 }
 
+/** What the catalogue needs from the live settings. */
+export interface CatalogSettings {
+  readonly baseURL: string
+  readonly timeoutMs: number
+  readonly WebError: WebErrorConstructor
+}
+
+/** The candidate source a request consults when no model is pinned. */
+export interface ModelCatalog {
+  /**
+   * The candidate ids, cheapest first, without the ones this process saw refuse.
+   * Reads the gateway catalogue when its cached answer is stale.
+   */
+  models(signal?: AbortSignal): Promise<readonly string[]>
+  /** Stop choosing a model for the life of the cached catalogue. */
+  remember(model: string): void
+}
+
 /**
  * Everything one gateway request needs except the credential value: endpoint,
  * the models to try in order, the reference a diagnostic names, the token
- * floor, the time bound, and the seam's error class.
+ * floor, the time bound, the catalogue to fall back on, and the seam's error
+ * class.
  *
  * Models are a list because the gateway rate-limits per model: a refused model
- * leaves the next one with its own budget, which is why a fallback turns five
- * requests a minute into ten without waiting.
+ * leaves the next one with its own budget. An empty list means discovery, not a
+ * misconfiguration, because the ids a release writes down go stale while the
+ * catalogue does not.
  */
 export interface GatewayOptions {
   readonly baseURL: string
   readonly models: readonly string[]
+  readonly catalog: ModelCatalog
   readonly credentialRef: string
   readonly count: number
   readonly maxOutputTokens: number

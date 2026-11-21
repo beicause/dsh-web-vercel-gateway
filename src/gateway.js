@@ -33,10 +33,17 @@
  */
 
 /**
- * The outcome of one request: the tool result, a failure worth retrying on
- * another model, or a route that no longer exists.
+ * The outcome of one request: the tool result, a failure worth another model, or
+ * a route that no longer exists.
+ *
+ * `permanent` tells the two kinds of failure apart. A permanent one is a
+ * decision the gateway makes about that model id — the plan does not cover it,
+ * the id is gone, or the model will not run a forced tool call — so it is worth
+ * remembering and skipping rather than trying again on the next operation. The
+ * other kind is a rate limit, a server fault, or a timeout, which says nothing
+ * about the model itself.
  * @typedef {{ kind: 'result', event: ToolResultEvent }
- *   | { kind: 'retry', error: Error, retryAfterSeconds?: number }
+ *   | { kind: 'retry', error: Error, permanent?: boolean, retryAfterSeconds?: number }
  *   | { kind: 'stale-route' }} AttemptOutcome
  */
 
@@ -157,18 +164,29 @@ function isRetiredRoute(status, text) {
 }
 
 /**
- * Whether a failed request is worth retrying on another model.
+ * Whether another model may answer after this status.
  *
  * 403 is retried because the gateway answers it with `no_providers_available`
  * when the credential's plan does not cover that model, which says nothing about
- * the next model in the list; a credential the gateway rejects outright is a 401
- * and is not retried. 429 and 5xx are per-model or transient, so the next model
- * has its own chance.
+ * the next model; 404 joins it because a discovered id can be retired between
+ * the catalogue read and the request. A credential the gateway rejects outright
+ * is a 401, and no model changes that. 429 and 5xx are per-model or transient, so
+ * the next model has its own chance.
  * @param {number} status HTTP status of the answer.
  * @returns {boolean} true when another model may still answer.
  */
 function isRetryableStatus(status) {
-  return status === 403 || status === 429 || status >= 500
+  return status === 403 || status === 404 || status === 429 || status >= 500
+}
+
+/**
+ * Whether a status is the gateway's verdict on that model id rather than a
+ * condition that may pass.
+ * @param {number} status HTTP status of the answer.
+ * @returns {boolean} true when the model itself is the problem.
+ */
+function isPermanentRefusal(status) {
+  return status === 403 || status === 404
 }
 
 /**
@@ -287,8 +305,8 @@ function httpFailure(options, model, WebError, status, text) {
   }
   if (status === 404) {
     return new WebError(
-      'Vercel AI Gateway found no model "' + model + '" (HTTP 404). Set the model '
-        + 'setting to an id the gateway serves, such as "google/gemini-2.5-flash-lite"' + suffix,
+      'Vercel AI Gateway found no model "' + model + '" (HTTP 404), so the gateway no longer '
+        + 'serves that id' + suffix,
       'WEB_PROVIDER_ERROR',
     )
   }
@@ -331,12 +349,35 @@ function retiredRoute(WebError, routes) {
 function missingResult(options, model, WebError, fragment, reason) {
   const tail = (fragment === undefined ? '' : '; model text: ' + fragment)
     + (reason === undefined ? '' : '; finish reason: ' + reason)
-  return new WebError(
+  const error = new WebError(
     'Vercel AI Gateway finished without running the tool on model "' + model
       + '". Raise the maxOutputTokens setting (currently ' + String(options.maxOutputTokens)
       + ') or choose a model that supports tool calls' + tail,
     'WEB_PROVIDER_ERROR',
   )
+  // A model that answers without the forced call does so every time, which is
+  // what makes it a candidate to skip rather than to try again later.
+  return markUnusable(error)
+}
+
+/**
+ * Mark an error as the gateway's verdict on that model id, so the caller can
+ * stop offering the id instead of failing every operation on it.
+ * @template {Error} T
+ * @param {T} error the error to mark.
+ * @returns {T} the same error, marked.
+ */
+function markUnusable(error) {
+  return Object.assign(error, { modelUnusable: true })
+}
+
+/**
+ * Whether an error came from a model the gateway cannot run this tool on.
+ * @param {unknown} error the thrown value.
+ * @returns {boolean} true when the model, not the request, is the problem.
+ */
+function isUnusableModel(error) {
+  return isRecord(error) ? error.modelUnusable === true : false
 }
 
 /**
@@ -478,11 +519,22 @@ async function attemptOnce(options, model, route, operation, signal) {
       if (isRetiredRoute(response.status, body)) return { kind: 'stale-route' }
       const error = httpFailure(options, model, WebError, response.status, body)
       if (!isRetryableStatus(response.status)) throw error
-      return { kind: 'retry', error, retryAfterSeconds: retryAfterSeconds(response.headers) }
+      return {
+        kind: 'retry',
+        error,
+        permanent: isPermanentRefusal(response.status),
+        retryAfterSeconds: retryAfterSeconds(response.headers),
+      }
     }
     try {
       return { kind: 'result', event: await readToolResult(response, options, model, operation, WebError) }
     } catch (error) {
+      // A stream that ran without the tool is that model declining the forced
+      // call, so the next candidate gets the request rather than the caller
+      // getting an error the settings cannot fix.
+      if (isUnusableModel(error)) {
+        return { kind: 'retry', error: /** @type {Error} */ (error), permanent: true }
+      }
       if (error instanceof WebError) throw error
       if (cancelled()) throw aborted(signal?.reason)
       if (timedOut) throw timeoutFailure(error, 'finish')
@@ -520,6 +572,11 @@ function exhaustedFailure(WebError, failures, delaySeconds) {
 
 /**
  * Run one gateway request that forces a provider-executed tool call.
+ *
+ * The candidate list is the configured one, or — when the setting names nothing —
+ * whatever the catalogue currently offers. Either way a model the gateway
+ * rejects permanently is reported to the catalogue, so this process stops
+ * spending a request on it.
  * @param {GatewayRequestOptions} options endpoint, models, credential, token floor, and timeout.
  * @param {GatewayOperation} operation tool identity and its arguments.
  * @param {AbortSignal} [signal] caller cancellation, forwarded to the request; omitted means none.
@@ -529,16 +586,16 @@ function exhaustedFailure(WebError, failures, delaySeconds) {
  */
 export async function callGateway(options, operation, signal) {
   const { WebError } = options
-  if (options.models.length === 0) {
-    throw new WebError('No gateway model is configured for the Vercel AI Gateway provider', 'WEB_PROVIDER_MISCONFIGURED')
-  }
+  const models = options.models.length > 0
+    ? options.models
+    : await options.catalog.models(signal)
   const routes = candidateRoutes(options.baseURL)
   let routeIndex = 0
   /** @type {number | undefined} */
   let delaySeconds
   /** @type {{ model: string, error: Error }[]} */
   const failures = []
-  for (const model of options.models) {
+  for (const model of models) {
     for (;;) {
       const outcome = await attemptOnce(options, model, routes[routeIndex], operation, signal)
       if (outcome.kind === 'result') return outcome.event
@@ -552,6 +609,7 @@ export async function callGateway(options, operation, signal) {
         }
         throw retiredRoute(WebError, routes)
       }
+      if (outcome.permanent === true) options.catalog.remember(model)
       if (outcome.retryAfterSeconds !== undefined) delaySeconds = outcome.retryAfterSeconds
       failures.push({ model, error: outcome.error })
       break
