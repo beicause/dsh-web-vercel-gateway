@@ -23,16 +23,13 @@ export type {
 
 /**
  * The seam's error class as a value: the providers receive it instead of
- * importing it, so the instance they throw is the one the harness checks with
- * `instanceof`. The shape is structural rather than the seam's own class type,
- * which also lets the offline tests pass a local class and keep every harness
- * package out of their import graph.
+ * importing it, so the instance they throw belongs to the module instance the
+ * harness checks with `instanceof`. Naming the seam's own class here rather
+ * than a structural equivalent keeps that identity visible to the typechecker;
+ * a test may still pass its own class, because the harness class has no private
+ * members and a subclass with a `code` field is assignable to it.
  */
-export type WebErrorConstructor = new (
-  message: string,
-  code: string,
-  options?: ErrorOptions,
-) => Error & { readonly code: string }
+export type WebErrorConstructor = typeof import('@deepseek-ai/dsh-web').WebError
 
 /** One provider-executed gateway tool: the gateway id and the name the model must call. */
 export interface GatewayTool {
