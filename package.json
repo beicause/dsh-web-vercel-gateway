@@ -19,7 +19,8 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh-CN.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=24.9"
