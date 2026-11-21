@@ -58,6 +58,16 @@ The route is versioned with the AI SDK protocol, and adjacent versions stay live
 | `vercel-deepseek-search` | `ctx.web.search` | Ranked sources; each carries `url`, and `title` / `snippet` / `summary` / `publishedAt` when the tool returns them. The tool's `authority`, `rerank_score`, `site_icon`, `site_name`, and per-result `content` are dropped: the seam cannot express them. |
 | `vercel-deepseek-fetch` | `ctx.web.fetch` | The page as Markdown, reported as HTTP 200. A target the tool cannot read is reported as a result carrying the tool's own status, because the seam treats a non-2xx answer as an outcome the model reads rather than as a thrown failure. |
 
+## Install
+
+The package declares `dsh.bundle.patch`, so the harness installs it as a bundle rather than as a plugin entry written by hand:
+
+```sh
+git clone git@github.com:beicause/dsh-web-vercel-gateway.git
+```
+
+Then install that checkout through the harness plugin manager, pointing it at the directory. The loader links the directory instead of copying it, so editing the sources and reloading the plugin is enough to pick up a change; nothing is written into the profile by hand. Take the bundle out the same way to revert.
+
 ## Settings
 
 | Field | Default | Meaning |

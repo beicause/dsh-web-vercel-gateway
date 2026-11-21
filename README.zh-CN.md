@@ -58,6 +58,16 @@
 | `vercel-deepseek-search` | `ctx.web.search` | 排好序的来源；每项都有 `url`，工具返回时还有 `title` / `snippet` / `summary` / `publishedAt`。工具给的 `authority`、`rerank_score`、`site_icon`、`site_name` 以及每条结果的 `content` 被丢弃：接口表达不了它们。 |
 | `vercel-deepseek-fetch` | `ctx.web.fetch` | 页面 Markdown，报为 HTTP 200。工具读不到的地址则报为带工具自身状态码的结果，因为接口把非 2xx 视作模型可读的结论，而不是抛出的失败。 |
 
+## 安装
+
+包里声明了 `dsh.bundle.patch`，所以它按 bundle 安装，而不是手写一条插件条目：
+
+```sh
+git clone git@github.com:beicause/dsh-web-vercel-gateway.git
+```
+
+然后在 harness 的插件管理器里指向这个检出目录安装。加载器会把该目录链接进来而不是复制，所以改完源码重载插件即可生效；整个过程不必手写 profile 里的任何条目。回退时同样用插件管理器把这个 bundle 卸掉。
+
 ## 设置
 
 | 字段 | 默认值 | 含义 |
