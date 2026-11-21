@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Vercel AI Gateway 网页搜索",
+    "description": "经 Vercel AI Gateway 的 DeepSeek Search 与 Fetch 工具执行网页搜索与网页获取。每次操作都是一次网关模型请求，因此按网关计费，并需要 AI_GATEWAY_API_KEY 凭证；缺少该凭证时网页工具不会出现。请在「网页搜索与获取」设置页中选择本提供方。"
+  }
+}

@@ -1,0 +1,15 @@
+# dsh-web-vercel-gateway bundle patch.
+#
+# One row: the plugin registers two ctx.web providers, "vercel-deepseek-search"
+# and "vercel-deepseek-fetch", and nothing else. Selecting them is a separate
+# decision made by the profile's own patch layer, because a bundle patch cannot
+# override a value the user layer already sets.
+#
+# The row carries no config so the plugin's own defaults apply: endpoint, model,
+# credential reference, result count, output-token floor, and timeout. Edit them
+# here or through the plugin's settings page, which writes to the user layer.
+
+- insert:
+    - id: web-vercel-gateway
+      name: "dsh-web-vercel-gateway"
+      config: {}

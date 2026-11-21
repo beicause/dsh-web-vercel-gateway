@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Vercel AI Gateway web search",
+    "description": "Runs web search and web fetch through Vercel AI Gateway's DeepSeek Search and Fetch tools. Each operation is one gateway model request, so it bills through the gateway and needs an AI_GATEWAY_API_KEY credential; without that credential the web tools stay hidden. Select it under Web search and fetch settings."
+  }
+}

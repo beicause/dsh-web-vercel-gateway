@@ -1,0 +1,26 @@
+{
+  // The sources are JavaScript with JSDoc types, so the compiler checks them
+  // without emitting; `allowJs` + `checkJs` is what makes `tsc -p` a typecheck
+  // rather than a no-op, and `noEmit` keeps the package build-free.
+  //
+  // `preserveSymlinks` stays off: the peer packages live under node_modules as
+  // symlinks into the store, and a peer's own type file names packages that
+  // only its store entry depends on. Following the real path is what lets
+  // `@deepseek-ai/dsh-web`'s declaration resolve `@deepseek-ai/dsh-llm` and so
+  // see `WebError`'s base class; preserving the symlink leaves that import
+  // unresolved and the base class empty.
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["index.js", "src", "test", "scripts"]
+}

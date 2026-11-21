@@ -1,0 +1,53 @@
+{
+  "name": "dsh-web-vercel-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Web search and fetch providers for the DeepSeek Harness ctx.web seam that run DeepSeek Search and Fetch through Vercel AI Gateway.",
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "src",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.9"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "smoke": "node scripts/smoke.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-credentials": "*",
+    "@deepseek-ai/dsh-launch-environment": "*",
+    "@deepseek-ai/dsh-web": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-launch-environment": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-web": "0.2.2-rc.2",
+    "@deepseek-ai/schemastery": "3.19.0",
+    "@types/node": "^26.6.4",
+    "typescript": "^5.9.3"
+  }
+}
