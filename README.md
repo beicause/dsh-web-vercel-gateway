@@ -14,12 +14,12 @@ Reading stops at the first `tool-result` event. Everything after it is the model
 
 ## When the gateway refuses
 
-The gateway limits each model separately — `google/gemini-2.5-flash-lite` allows five requests a minute on the free plan — so a second model has its own budget and turns five requests into ten. The `model` setting therefore holds an ordered list, and a request walks it when the answer is one another model could avoid:
+On the free plan the gateway limits each model separately, so a second model carries its own budget and can serve a request the first one refused. The `model` setting therefore holds an ordered list, and a request walks it when the answer is one another model could avoid:
 
 | Answer | Next model? | Why |
 |---|---|---|
-| 429 | Yes | The limit is per model; the next one is not limited yet. |
-| 403 | Yes | The gateway answers `no_providers_available` when the plan does not cover that model. |
+| 429 | Yes | The limit is per model; the next one has its own budget. |
+| 403 | Yes | The gateway answers `no_providers_available` when the plan does not cover that model — the free plan reaches only a subset of the catalogue. |
 | 5xx | Yes | Transient or provider-side. |
 | 401 | No | The credential itself is rejected; no model changes that. |
 | 404 | No | The model id is wrong; every attempt would fail the same way. |
