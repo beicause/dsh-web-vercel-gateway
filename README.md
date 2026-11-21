@@ -1,12 +1,16 @@
 # dsh-web-vercel-gateway
 
+[简体中文](README.zh-CN.md) · English
+
 Web search and fetch for the DeepSeek Harness `ctx.web` seam, executed by Vercel AI Gateway's DeepSeek Search and DeepSeek Fetch tools.
 
 ## Why one model request per operation
 
-The gateway publishes DeepSeek Search and DeepSeek Fetch as *gateway tools*, not as REST endpoints; `/v1/tools/search` and `/v1/tools/fetch` answer 404. The only way to run them is a language-model request on the gateway's AI SDK protocol route that pins the tool through `toolChoice`. Each request therefore costs one gateway model call, and the model's only job is to hand the arguments to the tool.
+The gateway publishes DeepSeek Search and DeepSeek Fetch as *gateway tools*, not as REST endpoints: paths such as `/v1/tools/search` answer 404. The only way to run them is a language-model request that pins the tool through `toolChoice`, so each operation costs one gateway model call and the model's only job is to hand the arguments to the tool.
 
-The request stops at the first `tool-result` event: the rest of the answer is the model narrating a result the provider already holds, so the stream is cancelled instead of drained. A search measured 2.5–4.4 s end to end and a fetch 1.2–3.9 s against `google/gemini-2.5-flash-lite`.
+The request goes to `/v4/ai/language-model`, the route that speaks the AI SDK's own wire protocol rather than the OpenAI-compatible `/v1/chat/completions`. The OpenAI-compatible route accepts these tools but only folds their results into model text: the structured payload is not returned, and `tool_choice` cannot pin a gateway tool at all.
+
+Reading stops at the first `tool-result` event. Everything after it is the model narrating a result this plugin already holds, so the stream is cancelled rather than drained, which also skips the output tokens for that narration. A search measured 2.5–4.4 s end to end and a fetch 1.2–3.9 s against `google/gemini-2.5-flash-lite`.
 
 ## Providers
 
@@ -76,6 +80,4 @@ pnpm test                    # offline: a local server speaks the event protocol
 AI_GATEWAY_API_KEY=vck_... pnpm smoke   # one real search and one real fetch
 ```
 
-The sources are JavaScript with JSDoc types, so there is no build step: `index.js` is what the
-loader imports. `tsconfig.json` only checks them. Its `preserveSymlinks` stays off on purpose —
-see the comment there.
+The sources are JavaScript with JSDoc types, so there is no build step: `index.js` is what the loader imports, and `tsconfig.json` only checks it. Its `preserveSymlinks` stays off on purpose — see the comment there.
