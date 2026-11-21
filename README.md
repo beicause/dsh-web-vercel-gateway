@@ -10,7 +10,24 @@ The gateway publishes DeepSeek Search and DeepSeek Fetch as *gateway tools*, not
 
 The request goes to `/v4/ai/language-model`, the route that speaks the AI SDK's own wire protocol rather than the OpenAI-compatible `/v1/chat/completions`. The OpenAI-compatible route accepts these tools but only folds their results into model text: the structured payload is not returned, and `tool_choice` cannot pin a gateway tool at all.
 
-Reading stops at the first `tool-result` event. Everything after it is the model narrating a result this plugin already holds, so the stream is cancelled rather than drained, which also skips the output tokens for that narration. A search measured 2.5–4.4 s end to end and a fetch 1.2–3.9 s against `google/gemini-2.5-flash-lite`.
+Reading stops at the first `tool-result` event. Everything after it is the model narrating a result this plugin already holds, so the stream is cancelled rather than drained, which also skips the output tokens for that narration. The prompt tells the model not to write around the call: without that instruction a model sometimes calls the tool twice, and the second call is not a better answer. A search measured 2.5–4.4 s end to end and a fetch 1.2–3.9 s against `google/gemini-2.5-flash-lite`.
+
+## When the gateway refuses
+
+The gateway limits each model separately — `google/gemini-2.5-flash-lite` allows five requests a minute on the free plan — so a second model has its own budget and turns five requests into ten. The `model` setting therefore holds an ordered list, and a request walks it when the answer is one another model could avoid:
+
+| Answer | Next model? | Why |
+|---|---|---|
+| 429 | Yes | The limit is per model; the next one is not limited yet. |
+| 403 | Yes | The gateway answers `no_providers_available` when the plan does not cover that model. |
+| 5xx | Yes | Transient or provider-side. |
+| 401 | No | The credential itself is rejected; no model changes that. |
+| 404 | No | The model id is wrong; every attempt would fail the same way. |
+| No tool result in the stream | No | A property of that model's behaviour, and the diagnostic already names it. |
+
+Nothing waits between attempts. When every model refuses, the error names each one and the delay the gateway asked for, because a web tool call that blocks for the length of a rate-limit window is worse than one that fails and says when to retry.
+
+The route is versioned with the AI SDK protocol, and adjacent versions stay live at once: `/v3` and `/v4` accept the same request body. So a configured route that answers 404 with a web page instead of JSON — what the platform serves for a path no deployment matches — is retried one version back before it counts as a failure. Earlier versions are not tried; the gateway answers those with a retirement notice rather than serving them.
 
 ## Providers
 
@@ -24,7 +41,7 @@ Reading stops at the first `tool-result` event. Everything after it is the model
 | Field | Default | Meaning |
 |---|---|---|
 | `baseURL` | `https://ai-gateway.vercel.sh/v4/ai/language-model` | Gateway route that accepts provider-executed tools. |
-| `model` | `google/gemini-2.5-flash-lite` | Model that performs the forced tool call. It must support tool calls and be available to your credential. |
+| `model` | `google/gemini-2.5-flash-lite, openai/gpt-4o-mini` | Models that perform the forced tool call, in retry order, separated by commas. Each must support tool calls and be available to your credential. |
 | `apiKeyEnv` | `AI_GATEWAY_API_KEY` | Credential reference of the gateway key, resolved through the harness credential service. |
 | `count` | `10` | Results requested per search, 1–50. A smaller `maxResults` on the request wins. |
 | `maxOutputTokens` | `2000` | Output-token floor. The gateway spends output budget before running the tool, so a small floor ends the stream with no tool result; 16 tokens reproduces that failure. |
@@ -61,9 +78,11 @@ Reverting means setting those two values back to `deepseek-search-api` and `deep
 
 | Condition | Result |
 |---|---|
-| 401 / 403 | `WEB_PROVIDER_ERROR` naming the credential reference and the model. |
+| 401 | `WEB_PROVIDER_ERROR` naming the credential reference. |
+| 403, every model | `WEB_PROVIDER_ERROR` naming each model and the plan limit. |
 | 404 | `WEB_PROVIDER_ERROR` naming the model and a model id the gateway serves. |
-| 429 | `WEB_PROVIDER_ERROR` naming rate limiting. |
+| 404 with a web page, every route | `WEB_PROVIDER_ERROR` naming `baseURL` and the routes tried, without quoting the page. |
+| 429, every model | `WEB_PROVIDER_ERROR` naming each model and the `retry-after` delay, without waiting. |
 | Stream ends without the tool result | `WEB_PROVIDER_ERROR` naming `maxOutputTokens` and its current value, with the stream's finish reason and trailing model text. |
 | Caller cancels | `WEB_ABORTED`. |
 | The plugin's own `timeoutMs` elapses | `WEB_PROVIDER_ERROR` stating the elapsed bound, never a cancellation. |

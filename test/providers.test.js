@@ -72,7 +72,7 @@ async function gateway(result, options = {}) {
  */
 const optionsFor = (baseURL, overrides = {}) => ({
   baseURL,
-  model: 'test/model',
+  models: ['test/model'],
   credentialRef: 'AI_GATEWAY_API_KEY',
   count: 10,
   maxOutputTokens: 2000,
@@ -151,7 +151,7 @@ test('available() checks settings shape without reading the credential', () => {
   const search = new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { keyConfigured: async () => false }))
   assert.equal(search.available(), true)
   assert.equal(new VercelSearchProvider(() => optionsFor('not a url')).available(), false)
-  assert.equal(new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { model: '' })).available(), false)
+  assert.equal(new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { models: [] })).available(), false)
   assert.equal(new VercelSearchProvider(() => optionsFor('https://gateway.invalid/x', { credentialRef: '' })).available(), false)
 })
 

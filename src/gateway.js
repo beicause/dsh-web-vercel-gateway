@@ -9,6 +9,14 @@
  * event: everything after it is the model narrating a result this module
  * already holds.
  *
+ * Two failures are worth another attempt rather than an error. A rate-limited
+ * or failed gateway call is retried on the next configured model, because the
+ * gateway limits per model, so a second model has its own budget. A route that
+ * answers 404 with a web page instead of JSON has been retired, and the previous
+ * protocol version of the same route is tried in its place. Neither retry waits:
+ * a web tool call that blocks for the length of a rate-limit window is worse
+ * than one that fails and says when to retry.
+ *
  * This module imports nothing. The caller supplies the seam's WebError class, so
  * the provider packages stay free of bare imports and resolve no module copy of
  * their own; an error thrown here is then an instance of the class the harness
@@ -22,6 +30,14 @@
  * @typedef {import('./contracts.js').GatewayRequestOptions} GatewayRequestOptions
  * @typedef {import('./contracts.js').ToolResultEvent} ToolResultEvent
  * @typedef {import('./contracts.js').WebErrorConstructor} WebErrorConstructor
+ */
+
+/**
+ * The outcome of one request: the tool result, a failure worth retrying on
+ * another model, or a route that no longer exists.
+ * @typedef {{ kind: 'result', event: ToolResultEvent }
+ *   | { kind: 'retry', error: Error, retryAfterSeconds?: number }
+ *   | { kind: 'stale-route' }} AttemptOutcome
  */
 
 /** Provider-executed search tool: the gateway id and the model-facing name it must be called by. */
@@ -39,11 +55,26 @@ const SPECIFICATION_VERSION = '4'
 /** Identity sent as user-agent; the gateway records it against the request. */
 const USER_AGENT = 'deepseek-harness-web-vercel-gateway'
 
-/** Prompt text of the request: the tool call is forced, so the turn only has to be one the model may answer. */
-const PROMPT_TEXT = 'Run the tool.'
+/**
+ * Prompt text of the request. The tool call is forced, so the turn only has to
+ * be one the model may answer; the instructions keep the model from spending
+ * output tokens before the call and from narrating or repeating it afterwards,
+ * which is what a stream without a tool result is diagnosed from.
+ */
+const PROMPT_TEXT = 'Call the tool now with the given arguments. Do not write any text before or'
+  + ' after the call. Do not repeat or summarise the tool result. Do not call any other tool.'
 
 /** Most trailing model text kept for the diagnostic of a stream that produced no tool result. */
 const FRAGMENT_MAX_CHARS = 300
+
+/** Most gateway response text kept for a failure message. */
+const DETAIL_MAX_CHARS = 300
+
+/** The versioned language-model route, whose number is the protocol version it speaks. */
+const ROUTE_PATTERN = /\/v(\d+)\/ai\/language-model$/
+
+/** Oldest route this module falls back to; earlier versions answer with a retirement notice. */
+const OLDEST_ROUTE_VERSION = 3
 
 /**
  * Whether a value is a JSON object rather than an array or a primitive.
@@ -73,17 +104,99 @@ export function nonEmpty(value) {
 }
 
 /**
+ * Split the model setting into the ordered candidate list a request walks.
+ *
+ * One field rather than a list field keeps existing single-model settings
+ * working unchanged, and the order is the retry order, so the cheapest model
+ * goes first and the fallback only runs when the gateway turns the first away.
+ * @param {string} text the model setting: one id, or several separated by commas or spaces.
+ * @returns {readonly string[]} the ids, in order, without blanks or repeats.
+ */
+export function parseModels(text) {
+  /** @type {string[]} */
+  const models = []
+  for (const part of text.split(/[,\s]+/)) {
+    const model = part.trim()
+    if (model.length === 0 || models.includes(model)) continue
+    models.push(model)
+  }
+  return models
+}
+
+/**
+ * The routes to try, in order: the configured one and, when it is a versioned
+ * language-model route, the previous protocol version.
+ *
+ * The gateway keeps adjacent protocol versions live at once, and the request
+ * body is the same for both, so a retired route degrades to its predecessor
+ * instead of failing until this plugin ships a new default. Earlier versions
+ * are not tried: the gateway answers those with a retirement notice rather than
+ * serving them.
+ * @param {string} baseURL the configured endpoint.
+ * @returns {readonly string[]} the endpoints to try, in order.
+ */
+export function candidateRoutes(baseURL) {
+  const match = ROUTE_PATTERN.exec(baseURL)
+  if (match === null || match.index === undefined) return [baseURL]
+  const version = Number(match[1])
+  if (!Number.isInteger(version) || version <= OLDEST_ROUTE_VERSION) return [baseURL]
+  const previous = baseURL.slice(0, match.index) + '/v' + String(version - 1) + '/ai/language-model'
+  return [baseURL, previous]
+}
+
+/**
+ * Whether an answer says the route itself is gone: a 404 carrying a web page
+ * rather than the gateway's JSON error body, which is how the platform serves a
+ * path that no deployment matches.
+ * @param {number} status HTTP status of the answer.
+ * @param {string} text its body text.
+ * @returns {boolean} true when the answer is a page, not the gateway's own error.
+ */
+function isRetiredRoute(status, text) {
+  return status === 404 && text.trimStart().startsWith('<')
+}
+
+/**
+ * Whether a failed request is worth retrying on another model.
+ *
+ * 403 is retried because the gateway answers it with `no_providers_available`
+ * when the credential's plan does not cover that model, which says nothing about
+ * the next model in the list; a credential the gateway rejects outright is a 401
+ * and is not retried. 429 and 5xx are per-model or transient, so the next model
+ * has its own chance.
+ * @param {number} status HTTP status of the answer.
+ * @returns {boolean} true when another model may still answer.
+ */
+function isRetryableStatus(status) {
+  return status === 403 || status === 429 || status >= 500
+}
+
+/**
+ * The delay the gateway asks for, in whole seconds.
+ * @param {Headers} headers headers of a rate-limited answer.
+ * @returns {number | undefined} the delay, when the answer names one.
+ */
+function retryAfterSeconds(headers) {
+  const raw = headers.get('retry-after') ?? headers.get('x-ratelimit-reset-requests')
+  if (raw === null) return undefined
+  const seconds = Number.parseFloat(raw)
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined
+  return Math.ceil(seconds)
+}
+
+/**
  * Build the request headers of one gateway call.
- * @param {GatewayRequestOptions} options endpoint, model, and credential value.
+ * @param {GatewayRequestOptions} options endpoint and credential value.
+ * @param {string} model the model this attempt asks for.
  * @returns {Record<string, string>} the headers, including the protocol and model-selection headers.
  */
-function requestHeaders(options) {
+function requestHeaders(options, model) {
   return {
     authorization: 'Bearer ' + options.apiKey,
     'ai-gateway-protocol-version': PROTOCOL_VERSION,
     'ai-gateway-auth-method': 'api-key',
     'ai-language-model-specification-version': SPECIFICATION_VERSION,
-    'ai-language-model-id': options.model,
+    'ai-language-model-id': model,
     'ai-language-model-streaming': 'true',
     'content-type': 'application/json',
     'user-agent': USER_AGENT,
@@ -112,6 +225,21 @@ function requestBody(options, operation) {
 }
 
 /**
+ * A response body as one short line, for a failure message.
+ *
+ * A body that is a web page is dropped whole: the route diagnostic already says
+ * what happened, and a page of markup says nothing a reader can act on.
+ * @param {string} text the response body text.
+ * @returns {string | undefined} the body when it is short text, otherwise undefined.
+ */
+function clampDetail(text) {
+  if (text.trimStart().startsWith('<')) return undefined
+  const flat = text.replace(/\s+/g, ' ').trim()
+  if (flat.length === 0) return undefined
+  return flat.length > DETAIL_MAX_CHARS ? flat.slice(0, DETAIL_MAX_CHARS) + '...' : flat
+}
+
+/**
  * The gateway's own message from an error body, when the body carries one.
  * @param {string} text the response body text.
  * @returns {string | undefined} the message, or undefined when the body has none.
@@ -120,46 +248,53 @@ function gatewayMessage(text) {
   try {
     /** @type {unknown} */
     const parsed = JSON.parse(text)
-    if (!isRecord(parsed)) return nonEmpty(text.trim())
+    if (!isRecord(parsed)) return clampDetail(text)
     const nested = isRecord(parsed.error) ? parsed.error : undefined
     return nonEmpty(typeof parsed.error === 'string' ? parsed.error : undefined)
       ?? nonEmpty(nested === undefined ? undefined : nested.message)
       ?? nonEmpty(parsed.message)
   } catch {
-    return nonEmpty(text.trim())
+    return clampDetail(text)
   }
 }
 
 /**
  * Turn one non-2xx answer into a failure that names the setting to change.
- * @param {GatewayOptions} options endpoint, model, and credential settings the request used.
+ * @param {GatewayOptions} options endpoint and credential settings the request used.
+ * @param {string} model the model this attempt asked for.
  * @param {WebErrorConstructor} WebError the seam's error class.
  * @param {number} status HTTP status of the answer.
  * @param {string} text its body text.
- * @returns {Error} the error to throw.
+ * @returns {Error} the error to throw or report.
  */
-function httpFailure(options, WebError, status, text) {
+function httpFailure(options, model, WebError, status, text) {
   const detail = gatewayMessage(text)
   const suffix = detail === undefined ? '' : ': ' + detail
   const label = String(status)
-  if (status === 401 || status === 403) {
+  if (status === 401) {
     return new WebError(
-      'Vercel AI Gateway rejected the credential (HTTP ' + label + '). Check that the '
-        + options.credentialRef + ' credential is valid and may use the model "'
-        + options.model + '"' + suffix,
+      'Vercel AI Gateway rejected the credential (HTTP 401). Check that the '
+        + options.credentialRef + ' credential is valid' + suffix,
+      'WEB_PROVIDER_ERROR',
+    )
+  }
+  if (status === 403) {
+    return new WebError(
+      'Vercel AI Gateway does not offer model "' + model + '" to this credential (HTTP 403); '
+        + 'the plan may not cover it' + suffix,
       'WEB_PROVIDER_ERROR',
     )
   }
   if (status === 404) {
     return new WebError(
-      'Vercel AI Gateway found no model "' + options.model + '" (HTTP 404). Set the model '
+      'Vercel AI Gateway found no model "' + model + '" (HTTP 404). Set the model '
         + 'setting to an id the gateway serves, such as "google/gemini-2.5-flash-lite"' + suffix,
       'WEB_PROVIDER_ERROR',
     )
   }
   if (status === 429) {
     return new WebError(
-      'Vercel AI Gateway rate-limited the request (HTTP 429); retry later or lower the request rate' + suffix,
+      'Vercel AI Gateway rate-limited model "' + model + '" (HTTP 429)' + suffix,
       'WEB_PROVIDER_ERROR',
     )
   }
@@ -167,20 +302,37 @@ function httpFailure(options, WebError, status, text) {
 }
 
 /**
+ * The failure for a route the gateway no longer serves.
+ * @param {WebErrorConstructor} WebError the seam's error class.
+ * @param {readonly string[]} routes the routes that were tried.
+ * @returns {Error} the error to throw.
+ */
+function retiredRoute(WebError, routes) {
+  return new WebError(
+    'Vercel AI Gateway answered HTTP 404 with a web page instead of JSON for '
+      + routes.map(route => '"' + route + '"').join(' and ')
+      + ', so the route is gone. The gateway versions this route with the AI SDK protocol; '
+      + 'set the baseURL setting to a route it serves, or leave it at the default',
+    'WEB_PROVIDER_ERROR',
+  )
+}
+
+/**
  * The failure for a stream that ended without the forced tool call, naming what
  * to change: a low output-token floor stops the gateway before the tool result,
  * and a model without tool support never produces one.
- * @param {GatewayOptions} options token floor and model the request used.
+ * @param {GatewayOptions} options token floor the request used.
+ * @param {string} model the model this attempt asked for.
  * @param {WebErrorConstructor} WebError the seam's error class.
  * @param {string | undefined} fragment trailing model text, when the stream produced any.
  * @param {string | undefined} reason the stream's finish reason, when it reported one.
  * @returns {Error} the error to throw.
  */
-function missingResult(options, WebError, fragment, reason) {
+function missingResult(options, model, WebError, fragment, reason) {
   const tail = (fragment === undefined ? '' : '; model text: ' + fragment)
     + (reason === undefined ? '' : '; finish reason: ' + reason)
   return new WebError(
-    'Vercel AI Gateway finished without running the tool on model "' + options.model
+    'Vercel AI Gateway finished without running the tool on model "' + model
       + '". Raise the maxOutputTokens setting (currently ' + String(options.maxOutputTokens)
       + ') or choose a model that supports tool calls' + tail,
     'WEB_PROVIDER_ERROR',
@@ -189,14 +341,19 @@ function missingResult(options, WebError, fragment, reason) {
 
 /**
  * Read one server-sent-event stream until the forced tool result arrives.
+ *
+ * Only the first matching result is returned. A model that ignores the
+ * instruction to stop may call the tool again, and the later result is not a
+ * better answer to the request this module made.
  * @param {Response} response the streaming answer.
  * @param {GatewayOptions} options settings the diagnostics name.
+ * @param {string} model the model this attempt asked for.
  * @param {GatewayOperation} operation tool identity the result must carry.
  * @param {WebErrorConstructor} WebError the seam's error class.
  * @returns {Promise<ToolResultEvent>} the tool-result event.
  */
-async function readToolResult(response, options, operation, WebError) {
-  if (response.body === null) throw missingResult(options, WebError, undefined, undefined)
+async function readToolResult(response, options, model, operation, WebError) {
+  if (response.body === null) throw missingResult(options, model, WebError, undefined, undefined)
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   /** @type {string[]} */
@@ -248,19 +405,22 @@ async function readToolResult(response, options, operation, WebError) {
     throw new WebError('Vercel AI Gateway reported an error: ' + streamError, 'WEB_PROVIDER_ERROR')
   }
   const fragment = text.length === 0 ? undefined : text.join('').slice(-FRAGMENT_MAX_CHARS)
-  throw missingResult(options, WebError, fragment, reason)
+  throw missingResult(options, model, WebError, fragment, reason)
 }
 
 /**
- * Run one gateway request that forces a provider-executed tool call.
- * @param {GatewayRequestOptions} options endpoint, model, credential, token floor, and timeout.
+ * Run one request on one model and one route.
+ * @param {GatewayRequestOptions} options endpoint, credential, token floor, and timeout.
+ * @param {string} model the model to ask for.
+ * @param {string} route the endpoint to call.
  * @param {GatewayOperation} operation tool identity and its arguments.
  * @param {AbortSignal} [signal] caller cancellation, forwarded to the request; omitted means none.
- * @returns {Promise<ToolResultEvent>} the tool-result event, whose payload the caller decodes.
+ * @returns {Promise<AttemptOutcome>} the result, or why another attempt may help.
  * @throws {Error} the seam's WebError: WEB_ABORTED when the caller cancels, and
- *   WEB_PROVIDER_ERROR for every other failure, including this module's timeout.
+ *   WEB_PROVIDER_ERROR for every failure no retry can fix, including this
+ *   module's own timeout.
  */
-export async function callGateway(options, operation, signal) {
+async function attemptOnce(options, model, route, operation, signal) {
   const { WebError } = options
   /** @param {unknown} cause */
   const aborted = (cause) => new WebError('Vercel AI Gateway request aborted', 'WEB_ABORTED', { cause })
@@ -295,10 +455,10 @@ export async function callGateway(options, operation, signal) {
     /** @type {Response} */
     let response
     try {
-      response = await fetch(options.baseURL, {
+      response = await fetch(route, {
         method: 'POST',
         redirect: 'error',
-        headers: requestHeaders(options),
+        headers: requestHeaders(options, model),
         body: JSON.stringify(requestBody(options, operation)),
         signal: controller.signal,
       })
@@ -315,10 +475,13 @@ export async function callGateway(options, operation, signal) {
         // The status alone still identifies the failure.
       }
       if (cancelled()) throw aborted(signal?.reason)
-      throw httpFailure(options, WebError, response.status, body)
+      if (isRetiredRoute(response.status, body)) return { kind: 'stale-route' }
+      const error = httpFailure(options, model, WebError, response.status, body)
+      if (!isRetryableStatus(response.status)) throw error
+      return { kind: 'retry', error, retryAfterSeconds: retryAfterSeconds(response.headers) }
     }
     try {
-      return await readToolResult(response, options, operation, WebError)
+      return { kind: 'result', event: await readToolResult(response, options, model, operation, WebError) }
     } catch (error) {
       if (error instanceof WebError) throw error
       if (cancelled()) throw aborted(signal?.reason)
@@ -329,4 +492,70 @@ export async function callGateway(options, operation, signal) {
     clearTimeout(timer)
     signal?.removeEventListener('abort', forward)
   }
+}
+
+/**
+ * The failure after every candidate model refused the request.
+ * @param {WebErrorConstructor} WebError the seam's error class.
+ * @param {{ model: string, error: Error }[]} failures the failures, in the order they happened.
+ * @param {number | undefined} delaySeconds the delay the gateway asked for, when it named one.
+ * @returns {Error} the error to throw.
+ */
+function exhaustedFailure(WebError, failures, delaySeconds) {
+  const wait = delaySeconds === undefined
+    ? ''
+    : ' Retry after ' + String(delaySeconds) + 's; this provider does not wait on its own.'
+  if (failures.length === 1) {
+    const only = failures[0]
+    if (wait.length === 0) return only.error
+    return new WebError(only.error.message + '.' + wait, 'WEB_PROVIDER_ERROR', { cause: only.error })
+  }
+  return new WebError(
+    'Vercel AI Gateway refused every configured model ('
+      + failures.map(failure => '"' + failure.model + '": ' + failure.error.message).join('; ')
+      + ').' + wait,
+    'WEB_PROVIDER_ERROR',
+  )
+}
+
+/**
+ * Run one gateway request that forces a provider-executed tool call.
+ * @param {GatewayRequestOptions} options endpoint, models, credential, token floor, and timeout.
+ * @param {GatewayOperation} operation tool identity and its arguments.
+ * @param {AbortSignal} [signal] caller cancellation, forwarded to the request; omitted means none.
+ * @returns {Promise<ToolResultEvent>} the tool-result event, whose payload the caller decodes.
+ * @throws {Error} the seam's WebError: WEB_ABORTED when the caller cancels, and
+ *   WEB_PROVIDER_ERROR for every other failure, including this module's timeout.
+ */
+export async function callGateway(options, operation, signal) {
+  const { WebError } = options
+  if (options.models.length === 0) {
+    throw new WebError('No gateway model is configured for the Vercel AI Gateway provider', 'WEB_PROVIDER_MISCONFIGURED')
+  }
+  const routes = candidateRoutes(options.baseURL)
+  let routeIndex = 0
+  /** @type {number | undefined} */
+  let delaySeconds
+  /** @type {{ model: string, error: Error }[]} */
+  const failures = []
+  for (const model of options.models) {
+    for (;;) {
+      const outcome = await attemptOnce(options, model, routes[routeIndex], operation, signal)
+      if (outcome.kind === 'result') return outcome.event
+      if (outcome.kind === 'stale-route') {
+        // A retired route says nothing about the model, so the same model is
+        // asked again on the previous protocol version before it counts as a
+        // failed model.
+        if (routeIndex + 1 < routes.length) {
+          routeIndex += 1
+          continue
+        }
+        throw retiredRoute(WebError, routes)
+      }
+      if (outcome.retryAfterSeconds !== undefined) delaySeconds = outcome.retryAfterSeconds
+      failures.push({ model, error: outcome.error })
+      break
+    }
+  }
+  throw exhaustedFailure(WebError, failures, delaySeconds)
 }

@@ -45,12 +45,16 @@ export interface GatewayOperation {
 
 /**
  * Everything one gateway request needs except the credential value: endpoint,
- * model, the reference a diagnostic names, the token floor, the time bound, and
- * the seam's error class.
+ * the models to try in order, the reference a diagnostic names, the token
+ * floor, the time bound, and the seam's error class.
+ *
+ * Models are a list because the gateway rate-limits per model: a refused model
+ * leaves the next one with its own budget, which is why a fallback turns five
+ * requests a minute into ten without waiting.
  */
 export interface GatewayOptions {
   readonly baseURL: string
-  readonly model: string
+  readonly models: readonly string[]
   readonly credentialRef: string
   readonly count: number
   readonly maxOutputTokens: number
@@ -95,6 +99,7 @@ export interface MutableSource {
  */
 export interface GatewaySettings {
   readonly baseURL: { get(): string }
+  /** One model id, or several separated by commas or spaces; the order is the retry order. */
   readonly model: { get(): string }
   readonly apiKeyEnv: { get(): string }
   readonly count: { get(): number }

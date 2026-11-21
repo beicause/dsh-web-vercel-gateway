@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { after, test } from 'node:test'
-import { callGateway, SEARCH_TOOL } from '../src/gateway.js'
+import { callGateway, candidateRoutes, parseModels, SEARCH_TOOL } from '../src/gateway.js'
 
 /** The seam's error shape, reproduced so this module needs no harness import. */
 class FakeWebError extends Error {
@@ -56,7 +56,7 @@ async function serve(handler) {
  */
 const optionsFor = (baseURL, overrides = {}) => ({
   baseURL,
-  model: 'test/model',
+  models: ['test/model'],
   apiKey: 'test-key',
   credentialRef: 'AI_GATEWAY_API_KEY',
   count: 10,
@@ -256,4 +256,147 @@ test('reports an unreachable endpoint', async () => {
     callGateway(optionsFor('http://127.0.0.1:1/v4/ai/language-model'), { tool: SEARCH_TOOL, args: { query: 'q' } }),
     (/** @type {any} */ error) => error.code === 'WEB_PROVIDER_ERROR' && error.message.includes('request failed'),
   )
+})
+test('parses the model setting into an ordered candidate list', () => {
+  assert.deepEqual(parseModels('a/b'), ['a/b'])
+  assert.deepEqual(parseModels('a/b, c/d'), ['a/b', 'c/d'])
+  assert.deepEqual(parseModels('  a/b ,c/d ,, a/b '), ['a/b', 'c/d'])
+  assert.deepEqual(parseModels(''), [])
+})
+
+test('derives the previous protocol route from a versioned one', () => {
+  assert.deepEqual(
+    candidateRoutes('https://ai-gateway.vercel.sh/v4/ai/language-model'),
+    ['https://ai-gateway.vercel.sh/v4/ai/language-model', 'https://ai-gateway.vercel.sh/v3/ai/language-model'],
+  )
+  // The oldest supported version has no predecessor to degrade to.
+  assert.deepEqual(
+    candidateRoutes('https://ai-gateway.vercel.sh/v3/ai/language-model'),
+    ['https://ai-gateway.vercel.sh/v3/ai/language-model'],
+  )
+  // A custom path is called exactly as configured.
+  assert.deepEqual(candidateRoutes('https://example.com/custom'), ['https://example.com/custom'])
+})
+
+test('retries a rate-limited model on the next one, without waiting', async () => {
+  /** @type {string[]} */
+  const asked = []
+  const baseURL = await serve((request, response) => {
+    asked.push(String(request.headers['ai-language-model-id']))
+    if (asked.length === 1) {
+      response.writeHead(429, { 'content-type': 'application/json', 'retry-after': '42' })
+      response.end(JSON.stringify({ error: { message: 'Rate limit exceeded', type: 'rate_limit_exceeded' } }))
+      return
+    }
+    const out = stream(response)
+    out.write(resultFrame({ results: [{ url: 'https://example.com' }] }))
+    out.end()
+  })
+  const started = Date.now()
+  const event = await callGateway(
+    optionsFor(baseURL, { models: ['first/model', 'second/model'] }),
+    { tool: SEARCH_TOOL, args: { query: 'q' } },
+  )
+  assert.equal(event.type, 'tool-result')
+  assert.deepEqual(asked, ['first/model', 'second/model'])
+  assert.ok(Date.now() - started < 2000, 'the fallback ran without waiting out the rate-limit window')
+})
+
+test('reports every refused model and the delay the gateway asked for', async () => {
+  const baseURL = await serve((_request, response) => {
+    response.writeHead(429, { 'content-type': 'application/json', 'retry-after': '42' })
+    response.end(JSON.stringify({ error: { message: 'Rate limit exceeded', type: 'rate_limit_exceeded' } }))
+  })
+  await assert.rejects(
+    callGateway(optionsFor(baseURL, { models: ['first/model', 'second/model'] }), { tool: SEARCH_TOOL, args: { query: 'q' } }),
+    (/** @type {any} */ error) => error.code === 'WEB_PROVIDER_ERROR'
+      && error.message.includes('first/model')
+      && error.message.includes('second/model')
+      && error.message.includes('Retry after 42s'),
+  )
+})
+
+test('does not retry a failure another model cannot fix', async () => {
+  let calls = 0
+  const baseURL = await serve((_request, response) => {
+    calls += 1
+    response.writeHead(401, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ error: { message: 'Authentication failed.', type: 'authentication_error' } }))
+  })
+  await assert.rejects(
+    callGateway(optionsFor(baseURL, { models: ['first/model', 'second/model'] }), { tool: SEARCH_TOOL, args: { query: 'q' } }),
+    (/** @type {any} */ error) => error.message.includes('AI_GATEWAY_API_KEY'),
+  )
+  assert.equal(calls, 1)
+})
+
+test('falls back to the previous protocol route when the configured one is retired', async () => {
+  /** @type {string[]} */
+  const paths = []
+  const baseURL = await serve((request, response) => {
+    const path = String(request.url)
+    paths.push(path)
+    if (path.startsWith('/v4/')) {
+      // What the platform serves for a path no deployment matches.
+      response.writeHead(404, { 'content-type': 'text/html; charset=utf-8' })
+      response.end('<!DOCTYPE html><html><head><title>404</title></head><body>not found</body></html>')
+      return
+    }
+    const out = stream(response)
+    out.write(resultFrame({ results: [{ url: 'https://example.com' }] }))
+    out.end()
+  })
+  const event = await callGateway(optionsFor(baseURL), { tool: SEARCH_TOOL, args: { query: 'q' } })
+  assert.equal(event.type, 'tool-result')
+  assert.deepEqual(paths, ['/v4/ai/language-model', '/v3/ai/language-model'])
+})
+
+test('reports a retired route without quoting its web page', async () => {
+  const page = '<!DOCTYPE html><html><body>' + 'x'.repeat(4000) + '</body></html>'
+  const baseURL = await serve((_request, response) => {
+    response.writeHead(404, { 'content-type': 'text/html; charset=utf-8' })
+    response.end(page)
+  })
+  await assert.rejects(
+    // A route with no predecessor, so both attempts are spent on it.
+    callGateway(optionsFor(baseURL.replace('/v4/', '/v3/')), { tool: SEARCH_TOOL, args: { query: 'q' } }),
+    (/** @type {any} */ error) => error.code === 'WEB_PROVIDER_ERROR'
+      && error.message.includes('baseURL')
+      && !error.message.includes('<!DOCTYPE html>')
+      && error.message.length < 600,
+  )
+})
+
+test('keeps the first tool result when the model calls the tool again', async () => {
+  const baseURL = await serve((_request, response) => {
+    const out = stream(response)
+    out.write(resultFrame({ results: [{ url: 'https://first.example' }] }))
+    out.write(frame({ type: 'tool-call', toolName: 'deepseek_search', input: { query: 'again' } }))
+    out.write(resultFrame({ results: [{ url: 'https://second.example' }] }))
+    out.end()
+  })
+  const event = await callGateway(optionsFor(baseURL), { tool: SEARCH_TOOL, args: { query: 'q' } })
+  assert.deepEqual(event.result, { results: [{ url: 'https://first.example' }] })
+})
+test('retries a model the plan does not cover on the next one', async () => {
+  /** @type {string[]} */
+  const asked = []
+  const baseURL = await serve((request, response) => {
+    const model = String(request.headers['ai-language-model-id'])
+    asked.push(model)
+    if (model === 'paid/model') {
+      response.writeHead(403, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ error: { message: 'Free tier users do not have access to this model.', type: 'no_providers_available' } }))
+      return
+    }
+    const out = stream(response)
+    out.write(resultFrame({ results: [{ url: 'https://example.com' }] }))
+    out.end()
+  })
+  const event = await callGateway(
+    optionsFor(baseURL, { models: ['paid/model', 'free/model'] }),
+    { tool: SEARCH_TOOL, args: { query: 'q' } },
+  )
+  assert.equal(event.type, 'tool-result')
+  assert.deepEqual(asked, ['paid/model', 'free/model'])
 })

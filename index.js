@@ -21,6 +21,7 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import z from '@deepseek-ai/schemastery'
 import { gatewayKeyConfigured, resolveGatewayKey } from './src/credential.js'
 import { VercelFetchProvider } from './src/fetch.js'
+import { parseModels } from './src/gateway.js'
 import { VercelSearchProvider } from './src/search.js'
 
 /**
@@ -38,8 +39,13 @@ export const inject = ['web']
 /** Default gateway endpoint: the AI SDK protocol route that accepts provider-executed tools. */
 const DEFAULT_BASE_URL = 'https://ai-gateway.vercel.sh/v4/ai/language-model'
 
-/** Default model: a free-tier model that answers a forced tool call in a few seconds. */
-const DEFAULT_MODEL = 'google/gemini-2.5-flash-lite'
+/**
+ * Default models, in retry order. The gateway limits each model separately, so a
+ * second model doubles the request budget; both entries answer a forced tool call
+ * in a few seconds and both were measured against the live gateway. Cheap first,
+ * because the fallback only runs when the gateway turns the first away.
+ */
+const DEFAULT_MODEL = 'google/gemini-2.5-flash-lite, openai/gpt-4o-mini'
 
 /** Default credential reference of the gateway key. */
 const DEFAULT_API_KEY_ENV = 'AI_GATEWAY_API_KEY'
@@ -60,7 +66,7 @@ const DEFAULT_TIMEOUT_MS = 60000
 /** Settings of both providers; every field is live so a settings page edit applies without a remount. */
 export const Config = z.object({
   baseURL: z.string().default(DEFAULT_BASE_URL).description('Gateway endpoint that accepts provider-executed tools.').volatile(),
-  model: z.string().default(DEFAULT_MODEL).description('Gateway model that performs the forced tool call.').volatile(),
+  model: z.string().default(DEFAULT_MODEL).description('Gateway models that perform the forced tool call, in retry order, separated by commas.').volatile(),
   apiKeyEnv: z.string().default(DEFAULT_API_KEY_ENV).role('credential-ref').description('Credential reference of the gateway key.').volatile(),
   count: z.number().step(1).min(1).max(50).default(DEFAULT_COUNT).description('Results requested per search.').volatile(),
   maxOutputTokens: z.number().step(1).min(256).default(DEFAULT_MAX_OUTPUT_TOKENS).description('Output-token floor of each gateway request.').volatile(),
@@ -77,7 +83,7 @@ export function apply(ctx, config) {
   /** @returns {ProviderOptions} the settings for the NEXT operation. */
   const options = () => ({
     baseURL: config.baseURL.get(),
-    model: config.model.get(),
+    models: parseModels(config.model.get()),
     credentialRef: config.apiKeyEnv.get(),
     count: config.count.get(),
     maxOutputTokens: config.maxOutputTokens.get(),

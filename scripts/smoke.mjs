@@ -6,6 +6,7 @@
  * still worth using.
  */
 import { VercelFetchProvider } from '../src/fetch.js'
+import { parseModels } from '../src/gateway.js'
 import { VercelSearchProvider } from '../src/search.js'
 
 /** The seam's error shape, so this script needs no harness import. */
@@ -30,7 +31,7 @@ if (apiKey === undefined || apiKey.length === 0) {
 /** @returns {import('../src/contracts.js').ProviderOptions} settings of one operation. */
 const options = () => ({
   baseURL: process.env.AI_GATEWAY_BASE_URL ?? 'https://ai-gateway.vercel.sh/v4/ai/language-model',
-  model: process.env.AI_GATEWAY_MODEL ?? 'google/gemini-2.5-flash-lite',
+  models: parseModels(process.env.AI_GATEWAY_MODEL ?? 'google/gemini-2.5-flash-lite, openai/gpt-4o-mini'),
   credentialRef: 'AI_GATEWAY_API_KEY',
   count: 3,
   maxOutputTokens: 2000,

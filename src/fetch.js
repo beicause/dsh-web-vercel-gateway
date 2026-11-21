@@ -84,7 +84,7 @@ export class VercelFetchProvider {
   /** @returns {boolean} whether the settings could address a gateway at all. */
   available() {
     const options = this.resolveOptions()
-    return options.credentialRef.length > 0 && options.model.length > 0 && URL.canParse(options.baseURL)
+    return options.credentialRef.length > 0 && options.models.length > 0 && URL.canParse(options.baseURL)
   }
 
   /** @returns {Promise<boolean>} whether the credential reference has a value. */
