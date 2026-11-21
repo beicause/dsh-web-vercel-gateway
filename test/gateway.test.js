@@ -418,3 +418,84 @@ test('retries a model the plan does not cover on the next one', async () => {
   assert.equal(event.type, 'tool-result')
   assert.deepEqual(asked, ['paid/model', 'free/model'])
 })
+
+test('reads a final frame the stream ended without terminating', async () => {
+  const baseURL = await serve((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    // No trailing newline: the connection closes right after the result.
+    response.end('data: ' + JSON.stringify({ type: 'tool-result', toolName: 'deepseek_search', result: { results: [{ url: 'https://tail.example' }] } }))
+  })
+  const event = await callGateway(optionsFor(baseURL), { tool: SEARCH_TOOL, args: { query: 'q' } })
+  assert.deepEqual(event.result, { results: [{ url: 'https://tail.example' }] })
+})
+
+test('maps a cancellation during discovery to WEB_ABORTED', async () => {
+  const controller = new AbortController()
+  /** @type {import('../src/contracts.js').ModelCatalog} */
+  const catalog = {
+    models: (signal) => new Promise((_resolve, reject) => {
+      // The catalogue answers only by rejecting with the caller's reason, which
+      // is what the shared prefetch does when a waiter gives up.
+      const fail = () => reject(signal?.reason)
+      if (signal?.aborted === true) fail()
+      else signal?.addEventListener('abort', fail, { once: true })
+    }),
+    remember: () => undefined,
+  }
+  const pending = callGateway(
+    optionsFor('http://127.0.0.1:1/unused', { models: [], catalog }),
+    { tool: SEARCH_TOOL, args: { query: 'q' } },
+    controller.signal,
+  )
+  setTimeout(() => controller.abort(), 20)
+  await assert.rejects(pending, (/** @type {any} */ error) => error.code === 'WEB_ABORTED')
+})
+
+test('reports a failed model list as its own failure', async () => {
+  /** @type {import('../src/contracts.js').ModelCatalog} */
+  const catalog = {
+    models: async () => { throw new Error('the catalogue answered 503') },
+    remember: () => undefined,
+  }
+  await assert.rejects(
+    callGateway(optionsFor('http://127.0.0.1:1/unused', { models: [], catalog }), { tool: SEARCH_TOOL, args: { query: 'q' } }),
+    (/** @type {any} */ error) => error.code === 'WEB_PROVIDER_ERROR' && error.message.includes('503'),
+  )
+})
+
+test('reads a millisecond delay as milliseconds', async () => {
+  const baseURL = await serve((_request, response) => {
+    response.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1500ms' })
+    response.end(JSON.stringify({ error: { message: 'Rate limit exceeded' } }))
+  })
+  await assert.rejects(
+    callGateway(optionsFor(baseURL), { tool: SEARCH_TOOL, args: { query: 'q' } }),
+    (/** @type {any} */ error) => error.message.includes('Retry after 2s'),
+  )
+})
+
+test('reports the longest delay the refused models asked for', async () => {
+  const baseURL = await serve((request, response) => {
+    const wait = request.headers['ai-language-model-id'] === 'first/model' ? '30' : '5'
+    response.writeHead(429, { 'content-type': 'application/json', 'retry-after': wait })
+    response.end(JSON.stringify({ error: { message: 'Rate limit exceeded' } }))
+  })
+  await assert.rejects(
+    callGateway(optionsFor(baseURL, { models: ['first/model', 'second/model'] }), { tool: SEARCH_TOOL, args: { query: 'q' } }),
+    (/** @type {any} */ error) => error.message.includes('Retry after 30s'),
+  )
+})
+
+test('keeps a timeout a timeout when the caller cancels afterwards', async () => {
+  const baseURL = await serve(() => {
+    // Never answers: the timer fires first, the cancellation lands second.
+  })
+  const controller = new AbortController()
+  const pending = callGateway(optionsFor(baseURL, { timeoutMs: 100 }), { tool: SEARCH_TOOL, args: { query: 'q' } }, controller.signal)
+  setTimeout(() => controller.abort(), 250)
+  await assert.rejects(
+    pending,
+    (/** @type {any} */ error) => error.code === 'WEB_PROVIDER_ERROR' && error.message.includes('100ms'),
+  )
+})
+

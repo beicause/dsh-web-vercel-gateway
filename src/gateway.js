@@ -197,9 +197,23 @@ function isPermanentRefusal(status) {
 function retryAfterSeconds(headers) {
   const raw = headers.get('retry-after') ?? headers.get('x-ratelimit-reset-requests')
   if (raw === null) return undefined
-  const seconds = Number.parseFloat(raw)
-  if (!Number.isFinite(seconds) || seconds < 0) return undefined
-  return Math.ceil(seconds)
+  const value = raw.trim()
+  // `retry-after` is seconds by definition, but the sibling rate-limit header
+  // writes durations with a unit (`42ms`), where reading the number alone would
+  // report a wait a thousand times too long.
+  const duration = /^(\d+(?:\.\d+)?)\s*(ms|s|m)?$/i.exec(value)
+  if (duration !== null) {
+    const amount = Number.parseFloat(duration[1])
+    const unit = (duration[2] ?? 's').toLowerCase()
+    if (!Number.isFinite(amount) || amount < 0) return undefined
+    const seconds = unit === 'ms' ? amount / 1000 : unit === 'm' ? amount * 60 : amount
+    return Math.ceil(seconds)
+  }
+  // An HTTP date is also allowed here; its distance from now is the wait.
+  const at = Date.parse(value)
+  if (Number.isNaN(at)) return undefined
+  const seconds = (at - Date.now()) / 1000
+  return seconds <= 0 ? undefined : Math.ceil(seconds)
 }
 
 /**
@@ -404,6 +418,36 @@ async function readToolResult(response, options, model, operation, WebError) {
   let reason
   /** @type {string | undefined} */
   let streamError
+  /**
+   * Read one line of the stream, recording what it carries.
+   * @param {string} line raw line text, without its terminator.
+   * @returns {ToolResultEvent | undefined} the tool result, when this line carried it.
+   */
+  const readLine = (line) => {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) return undefined
+    const payload = trimmed.slice(5).trim()
+    if (payload.length === 0) return undefined
+    /** @type {unknown} */
+    let event
+    try {
+      event = JSON.parse(payload)
+    } catch {
+      // A frame this module cannot read carries nothing it needs: the tool
+      // result arrives as its own complete frame.
+      return undefined
+    }
+    if (!isRecord(event)) return undefined
+    if (event.type === 'tool-result' && event.toolName === operation.tool.name) {
+      return /** @type {ToolResultEvent} */ (/** @type {unknown} */ (event))
+    }
+    if (event.type === 'text-delta' && typeof event.delta === 'string') text.push(event.delta)
+    if (event.type === 'finish' && isRecord(event.finishReason)) {
+      reason = nonEmpty(event.finishReason.unified) ?? nonEmpty(event.finishReason.raw)
+    }
+    if (event.type === 'error') streamError = gatewayMessage(JSON.stringify(event))
+    return undefined
+  }
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -411,31 +455,19 @@ async function readToolResult(response, options, model, operation, WebError) {
       pending += decoder.decode(value, { stream: true })
       let newline = pending.indexOf('\n')
       while (newline !== -1) {
-        const line = pending.slice(0, newline).trim()
+        const line = pending.slice(0, newline)
         pending = pending.slice(newline + 1)
         newline = pending.indexOf('\n')
-        if (!line.startsWith('data:')) continue
-        const payload = line.slice(5).trim()
-        if (payload.length === 0) continue
-        /** @type {unknown} */
-        let event
-        try {
-          event = JSON.parse(payload)
-        } catch {
-          // A frame this module cannot read carries nothing it needs: the tool
-          // result arrives as its own complete frame.
-          continue
-        }
-        if (!isRecord(event)) continue
-        if (event.type === 'tool-result' && event.toolName === operation.tool.name) {
-          return /** @type {ToolResultEvent} */ (/** @type {unknown} */ (event))
-        }
-        if (event.type === 'text-delta' && typeof event.delta === 'string') text.push(event.delta)
-        if (event.type === 'finish' && isRecord(event.finishReason)) {
-          reason = nonEmpty(event.finishReason.unified) ?? nonEmpty(event.finishReason.raw)
-        }
-        if (event.type === 'error') streamError = gatewayMessage(JSON.stringify(event))
+        const found = readLine(line)
+        if (found !== undefined) return found
       }
+    }
+    // A stream that ends mid-line still ends: its last frame counts, because a
+    // gateway closing the connection right after the result leaves no newline.
+    pending += decoder.decode()
+    if (pending.length > 0) {
+      const found = readLine(pending)
+      if (found !== undefined) return found
     }
   } finally {
     // Stopping at the result leaves the rest of the stream unread on purpose;
@@ -504,8 +536,11 @@ async function attemptOnce(options, model, route, operation, signal) {
         signal: controller.signal,
       })
     } catch (error) {
-      if (cancelled()) throw aborted(signal?.reason)
+      // The timeout is this module's own decision and is checked first: once the
+      // timer fired, an abort that lands a moment later must not relabel a
+      // timeout as the caller's cancellation.
       if (timedOut) throw timeoutFailure(error, 'answer')
+      if (cancelled()) throw aborted(signal?.reason)
       throw new WebError('Vercel AI Gateway request failed: ' + errorMessage(error), 'WEB_PROVIDER_ERROR', { cause: error })
     }
     if (!response.ok) {
@@ -515,6 +550,7 @@ async function attemptOnce(options, model, route, operation, signal) {
       } catch {
         // The status alone still identifies the failure.
       }
+      if (timedOut) throw timeoutFailure(new Error('the gateway answered ' + String(response.status)), 'answer')
       if (cancelled()) throw aborted(signal?.reason)
       if (isRetiredRoute(response.status, body)) return { kind: 'stale-route' }
       const error = httpFailure(options, model, WebError, response.status, body)
@@ -536,13 +572,39 @@ async function attemptOnce(options, model, route, operation, signal) {
         return { kind: 'retry', error: /** @type {Error} */ (error), permanent: true }
       }
       if (error instanceof WebError) throw error
-      if (cancelled()) throw aborted(signal?.reason)
       if (timedOut) throw timeoutFailure(error, 'finish')
+      if (cancelled()) throw aborted(signal?.reason)
       throw new WebError('Vercel AI Gateway stream failed: ' + errorMessage(error), 'WEB_PROVIDER_ERROR', { cause: error })
     }
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener('abort', forward)
+  }
+}
+
+/**
+ * The candidate list, read from the catalogue when no model is pinned.
+ *
+ * Discovery waits on a signal that is not its own — a prefetch shared with other
+ * operations — so a cancellation arrives there as the raw reason rather than as
+ * this seam's error. Mapping it here is what keeps a cancelled first search
+ * reporting WEB_ABORTED like every other cancelled request, instead of leaking a
+ * DOMException the harness cannot classify.
+ * @param {GatewayRequestOptions} options endpoint, catalogue, and error class.
+ * @param {AbortSignal} [signal] caller cancellation.
+ * @returns {Promise<readonly string[]>} the candidates to walk.
+ * @throws {Error} the seam's WebError: WEB_ABORTED when the caller cancels.
+ */
+async function discoverModels(options, signal) {
+  const { WebError } = options
+  try {
+    return await options.catalog.models(signal)
+  } catch (error) {
+    if (signal?.aborted === true) {
+      throw new WebError('Vercel AI Gateway request aborted', 'WEB_ABORTED', { cause: signal.reason })
+    }
+    if (error instanceof WebError) throw error
+    throw new WebError('Vercel AI Gateway model list could not be read: ' + errorMessage(error), 'WEB_PROVIDER_ERROR', { cause: error })
   }
 }
 
@@ -588,7 +650,7 @@ export async function callGateway(options, operation, signal) {
   const { WebError } = options
   const models = options.models.length > 0
     ? options.models
-    : await options.catalog.models(signal)
+    : await discoverModels(options, signal)
   const routes = candidateRoutes(options.baseURL)
   let routeIndex = 0
   /** @type {number | undefined} */
@@ -610,7 +672,13 @@ export async function callGateway(options, operation, signal) {
         throw retiredRoute(WebError, routes)
       }
       if (outcome.permanent === true) options.catalog.remember(model)
-      if (outcome.retryAfterSeconds !== undefined) delaySeconds = outcome.retryAfterSeconds
+      // Several models can each name a wait; the longest one is what a caller
+      // who retries once must actually observe.
+      if (outcome.retryAfterSeconds !== undefined) {
+        delaySeconds = delaySeconds === undefined
+          ? outcome.retryAfterSeconds
+          : Math.max(delaySeconds, outcome.retryAfterSeconds)
+      }
       failures.push({ model, error: outcome.error })
       break
     }

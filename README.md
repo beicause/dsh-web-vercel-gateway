@@ -28,7 +28,7 @@ The survivors are ordered price-ascending, except that zero-priced entries go la
 
 The catalogue needs no credential and carries no plan information: a model the plan does not cover still appears there and answers 403 when asked. So a refusal is remembered rather than predicted.
 
-Discovery costs one request and is reused for six hours, together with every refusal. That request starts when the plugin mounts rather than when the first search arrives — it is a prefetch, so mounting neither waits for it nor fails with it, and a failed prefetch simply leaves the next operation to read the catalogue itself. Measured, the difference is 1.8 s against 4.1 s for the first search. A model pinned in `model` skips discovery entirely, and the same setting also works as an override when discovery is unwelcome.
+Discovery costs one request and is reused for six hours, together with every refusal. The request starts when the plugin mounts rather than when the first search arrives: it is a prefetch, so mounting neither waits for it nor fails with it, and a prefetch that fails leaves the next operation to read the catalogue itself. Measured, that removes 2.3 s from the first search (1.8 s against 4.1 s). A pinned `model` skips discovery entirely and is also how to opt out of it where the catalogue endpoint is unwanted.
 
 Concurrent operations share one read: a search and a fetch starting together on a cold cache read the catalogue once, not twice. Cancelling one of them stops that caller's wait without discarding the answer the other is waiting for.
 

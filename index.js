@@ -109,7 +109,11 @@ export function apply(ctx, config) {
   // gateway is unreachable, and a process that never searches should not care
   // either way. This only removes the wait from the first search; a prefetch
   // that fails leaves the lazy path exactly as it was.
-  catalog.warm()
+  //
+  // A pinned model setting means discovery is never consulted, so prefetching
+  // there would be a request the settings say nobody wants — which is the case
+  // where the catalogue endpoint is unreachable and pinning is the answer.
+  if (parseModels(config.model.get()).length === 0) catalog.warm()
   const search = new VercelSearchProvider(options)
   const fetch = new VercelFetchProvider(options)
   ctx.web.registerSearchProvider({
